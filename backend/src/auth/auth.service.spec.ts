@@ -40,6 +40,7 @@ describe('AuthService', () => {
     mockRefreshTokenStore = {
       issueRefreshToken: jest.fn().mockResolvedValue('mock-refresh-token'),
       validateAndRotateRefreshToken: jest.fn(),
+      setActiveAccessJti: jest.fn().mockResolvedValue(undefined),
       revokeRefreshToken: jest.fn(),
     };
 
@@ -65,7 +66,9 @@ describe('AuthService', () => {
 
       const challenge = await service.generateChallenge(TEST_ADDRESS);
 
-      expect(challenge).toMatch(/^Sign this message to authenticate with TrustFlow: [a-f0-9]{64}$/);
+      expect(challenge).toMatch(
+        /^Sign this message to authenticate with TrustFlow: [a-f0-9]{64}:\d+$/,
+      );
       expect(mockNonceStore.store).toHaveBeenCalledWith(
         TEST_ADDRESS,
         challenge,
@@ -155,6 +158,63 @@ describe('AuthService', () => {
       );
       await expect(service.verifySignature(keypair.publicKey(), signature)).rejects.toThrow(
         'Challenge already used',
+      );
+    });
+  });
+
+  // #845: the embedded expiry is enforced even if the stored challenge outlived its TTL.
+  describe('challenge expiry', () => {
+    it('rejects a validly signed challenge whose embedded expiry has passed', async () => {
+      const keypair = Keypair.random();
+      const nonce = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+      const expiredAt = Math.floor(Date.now() / 1000) - 5;
+      const challenge = `Sign this message to authenticate with TrustFlow: ${nonce}:${expiredAt}`;
+      const signature = keypair.sign(Buffer.from(challenge, 'utf-8')).toString('base64');
+
+      mockNonceStore.consume.mockResolvedValue(challenge);
+      mockNonceStore.markNonceUsed.mockResolvedValue(true);
+
+      await expect(service.verifySignature(keypair.publicKey(), signature)).rejects.toThrow(
+        'Challenge expired',
+      );
+      expect(mockNonceStore.markNonceUsed).not.toHaveBeenCalled();
+    });
+
+    it('accepts a validly signed challenge before its embedded expiry', async () => {
+      const keypair = Keypair.random();
+      const nonce = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+      const expiresAt = Math.floor(Date.now() / 1000) + 60;
+      const challenge = `Sign this message to authenticate with TrustFlow: ${nonce}:${expiresAt}`;
+      const signature = keypair.sign(Buffer.from(challenge, 'utf-8')).toString('base64');
+
+      mockNonceStore.consume.mockResolvedValue(challenge);
+      mockNonceStore.markNonceUsed.mockResolvedValue(true);
+
+      await expect(service.verifySignature(keypair.publicKey(), signature)).resolves.toBe(true);
+      expect(mockNonceStore.markNonceUsed).toHaveBeenCalledWith(nonce);
+    });
+  });
+
+  // #847: each refresh records a new active jti for the session, superseding the old token.
+  describe('refreshAccessToken', () => {
+    it('binds the new access token to the refreshed session', async () => {
+      mockRefreshTokenStore.validateAndRotateRefreshToken.mockResolvedValue({
+        valid: true,
+        newToken: 'rotated-refresh-token',
+        familyId: 'session-1',
+      });
+
+      const result = await service.refreshAccessToken('old-refresh-token', TEST_ADDRESS);
+
+      expect(result).toEqual({ token: 'mock-jwt-token', refreshToken: 'rotated-refresh-token' });
+      expect(mockRefreshTokenStore.setActiveAccessJti).toHaveBeenCalledWith(
+        'session-1',
+        expect.any(String),
+      );
+      const [, jti] = mockRefreshTokenStore.setActiveAccessJti.mock.calls[0];
+      expect(mockJwtService.sign).toHaveBeenCalledWith(
+        { address: TEST_ADDRESS, sub: TEST_ADDRESS, sid: 'session-1', jti },
+        expect.anything(),
       );
     });
   });

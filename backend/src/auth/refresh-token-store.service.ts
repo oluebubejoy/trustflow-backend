@@ -12,6 +12,7 @@ export class RefreshTokenStoreService {
   private readonly logger = new SanitizedLogger(RefreshTokenStoreService.name);
   private readonly inMemoryTokens = new Map<string, { issuedAt: number; familyId: string }>();
   private readonly inMemoryFamilies = new Map<string, Set<string>>();
+  private readonly inMemoryActiveJti = new Map<string, { jti: string; expiresAt: number }>();
 
   private get redis(): Redis | null {
     return this.redisClient;
@@ -19,9 +20,11 @@ export class RefreshTokenStoreService {
 
   constructor(@Inject(REDIS_CLIENT) private readonly redisClient: Redis | null) {}
 
-  async issueRefreshToken(address: string): Promise<string> {
+  async issueRefreshToken(
+    address: string,
+    familyId: string = crypto.randomBytes(16).toString('hex'),
+  ): Promise<string> {
     const token = crypto.randomBytes(32).toString('hex');
-    const familyId = crypto.randomBytes(16).toString('hex');
     const key = this.tokenKey(token);
     const familyKey = this.familyKey(address, familyId);
 
@@ -58,7 +61,7 @@ export class RefreshTokenStoreService {
   async validateAndRotateRefreshToken(
     token: string,
     address: string,
-  ): Promise<{ valid: boolean; newToken?: string; shouldRevoke?: boolean }> {
+  ): Promise<{ valid: boolean; newToken?: string; familyId?: string; shouldRevoke?: boolean }> {
     const key = this.tokenKey(token);
     const tombstoneKey = this.tombstoneKey(token);
 
@@ -108,7 +111,7 @@ export class RefreshTokenStoreService {
           .expire(familyKey, REFRESH_TOKEN_TTL_SECONDS)
           .exec();
 
-        return { valid: true, newToken };
+        return { valid: true, newToken, familyId: parsed.familyId };
       } catch (err) {
         this.logger.warn('Redis unavailable for token validation, falling back to memory');
       }
@@ -138,7 +141,44 @@ export class RefreshTokenStoreService {
     this.inMemoryTokens.set(newToken, { issuedAt: Date.now(), familyId: entry.familyId });
     family.add(newToken);
 
-    return { valid: true, newToken };
+    return { valid: true, newToken, familyId: entry.familyId };
+  }
+
+  /**
+   * Records `jti` as the only valid access token for session `familyId` (#847). Issuing a new
+   * access token on refresh overwrites it, so the previous access token is rejected.
+   */
+  async setActiveAccessJti(familyId: string, jti: string): Promise<void> {
+    const key = this.activeJtiKey(familyId);
+
+    if (this.redis) {
+      try {
+        await this.redis.set(key, jti, 'EX', ACCESS_TOKEN_TTL_SECONDS);
+        return;
+      } catch (err) {
+        this.logger.warn('Redis unavailable for access token tracking, falling back to memory');
+      }
+    }
+
+    this.inMemoryActiveJti.set(key, { jti, expiresAt: Date.now() + ACCESS_TOKEN_TTL_SECONDS * 1000 });
+  }
+
+  /** False only when a newer access token has been issued for the same session. */
+  async isActiveAccessJti(familyId: string, jti: string): Promise<boolean> {
+    const key = this.activeJtiKey(familyId);
+
+    if (this.redis) {
+      try {
+        const active = await this.redis.get(key);
+        return active === null || active === jti;
+      } catch (err) {
+        this.logger.warn('Redis unavailable for access token check, falling back to memory');
+      }
+    }
+
+    const entry = this.inMemoryActiveJti.get(key);
+    if (!entry || Date.now() > entry.expiresAt) return true;
+    return entry.jti === jti;
   }
 
   async revokeRefreshToken(address: string, token: string): Promise<void> {
@@ -183,6 +223,10 @@ export class RefreshTokenStoreService {
 
   private tokenKey(token: string): string {
     return `refresh-token:${token}`;
+  }
+
+  private activeJtiKey(familyId: string): string {
+    return `access-jti:${familyId}`;
   }
 
   private tombstoneKey(token: string): string {

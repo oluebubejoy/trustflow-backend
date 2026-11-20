@@ -4,7 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import * as crypto from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config, getJwtVerificationSecrets } from '../config/env.config';
-import { NonceStoreService } from './nonce-store.service';
+import { NonceStoreService, NONCE_TTL_SECONDS } from './nonce-store.service';
 import { JWT_ALGORITHM } from '../config/env.config';
 import { RefreshTokenStoreService, ACCESS_TOKEN_TTL_SECONDS } from './refresh-token-store.service';
 
@@ -41,7 +41,10 @@ export class AuthService {
     }
 
     const nonce = crypto.randomBytes(32).toString('hex');
-    const challenge = `${CHALLENGE_PREFIX}${nonce}`;
+    // #845: the expiry is part of the signed message and checked in verifySignature, so
+    // acceptance doesn't rely solely on the Redis key's TTL being enforced on time.
+    const expiresAt = Math.floor(Date.now() / 1000) + NONCE_TTL_SECONDS;
+    const challenge = `${CHALLENGE_PREFIX}${nonce}:${expiresAt}`;
 
     // The store hands back an already-pending challenge rather than replacing it (#369).
     const active = (await this.nonceStore.store(address, challenge, nonce)) ?? challenge;
@@ -57,6 +60,10 @@ export class AuthService {
     }
 
     const nonce = this.extractNonce(challenge);
+    const expiresAt = this.extractExpiry(challenge);
+    if (expiresAt !== null && Date.now() > expiresAt * 1000) {
+      throw new UnauthorizedException('Challenge expired');
+    }
 
     try {
       const signatureBuffer = Buffer.from(signature, 'base64');
@@ -84,14 +91,35 @@ export class AuthService {
     }
   }
 
-  generateToken(address: string, ttlSeconds?: number): string {
-    const payload = { address, sub: address };
+  generateToken(
+    address: string,
+    ttlSeconds?: number,
+    session?: { sid: string; jti: string },
+  ): string {
+    const payload = session ? { address, sub: address, ...session } : { address, sub: address };
     const options = ttlSeconds ? { expiresIn: ttlSeconds } : {};
     return this.jwtService.sign(payload, options);
   }
 
   async generateRefreshToken(address: string): Promise<string> {
     return this.refreshTokenStore.issueRefreshToken(address);
+  }
+
+  /**
+   * Issues a refresh token and an access token bound to the same session (#847), so a later
+   * refresh supersedes this access token instead of minting an independent sibling.
+   */
+  async issueSession(address: string): Promise<{ token: string; refreshToken: string }> {
+    const sid = crypto.randomBytes(16).toString('hex');
+    const refreshToken = await this.refreshTokenStore.issueRefreshToken(address, sid);
+    const token = await this.issueSessionAccessToken(address, sid);
+    return { token, refreshToken };
+  }
+
+  private async issueSessionAccessToken(address: string, sid: string): Promise<string> {
+    const jti = crypto.randomBytes(16).toString('hex');
+    await this.refreshTokenStore.setActiveAccessJti(sid, jti);
+    return this.generateToken(address, ACCESS_TOKEN_TTL_SECONDS, { sid, jti });
   }
 
   async refreshAccessToken(
@@ -102,11 +130,11 @@ export class AuthService {
       refreshToken,
       address,
     );
-    if (!result.valid || !result.newToken) {
+    if (!result.valid || !result.newToken || !result.familyId) {
       return null;
     }
 
-    const newAccessToken = this.generateToken(address, ACCESS_TOKEN_TTL_SECONDS);
+    const newAccessToken = await this.issueSessionAccessToken(address, result.familyId);
     return {
       token: newAccessToken,
       refreshToken: result.newToken,
@@ -127,7 +155,16 @@ export class AuthService {
 
   private extractNonce(challenge: string): string | null {
     if (!challenge.startsWith(CHALLENGE_PREFIX)) return null;
-    return challenge.slice(CHALLENGE_PREFIX.length);
+    return challenge.slice(CHALLENGE_PREFIX.length).split(':')[0];
+  }
+
+  /** Expiry (unix seconds) embedded in the challenge, or null if the challenge has none. */
+  private extractExpiry(challenge: string): number | null {
+    if (!challenge.startsWith(CHALLENGE_PREFIX)) return null;
+    const expiry = challenge.slice(CHALLENGE_PREFIX.length).split(':')[1];
+    if (expiry === undefined) return null;
+    const value = Number(expiry);
+    return Number.isFinite(value) ? value : 0;
   }
 
   private maskAddress(address: string): string {

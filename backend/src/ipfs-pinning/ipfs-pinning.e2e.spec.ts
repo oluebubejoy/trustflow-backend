@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import request from 'supertest';
+import { Keypair } from '@stellar/stellar-sdk';
 import { IpfsPinningModule } from './ipfs-pinning.module';
 import { JwtStrategy } from '../auth/jwt.strategy';
 import { computeCidV1Raw } from './cid.util';
@@ -99,7 +100,7 @@ describe('IPFS Pinning (API integration)', () => {
     await app.init();
 
     const jwtService = moduleFixture.get(JwtService);
-    const address = 'GTESTADDRESS1111111111111111111111111111111111111PINS';
+    const address = Keypair.random().publicKey();
     authHeader = `Bearer ${jwtService.sign({ address, sub: address })}`;
   });
 

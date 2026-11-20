@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
+import { Keypair } from '@stellar/stellar-sdk';
 import { AuthModule } from '../auth/auth.module';
 import { AuthService } from '../auth/auth.service';
 import { RedisModule } from '../common/redis/redis.module';
@@ -27,8 +28,8 @@ describe('UserProfile (E2E) — POST /profiles auth', () => {
   // Stellar addresses are base32 (A-Z, 2-7 only — no 0/1/8/9), enforced by
   // STELLAR_ADDRESS_REGEX in user-profile.dto.ts; these must satisfy it or
   // CreateUserProfileSchema.parse() throws before the auth check ever runs.
-  const OWNER_ADDRESS = 'G' + 'A'.repeat(55);
-  const OTHER_ADDRESS = 'G' + 'B'.repeat(55);
+  const OWNER_ADDRESS = Keypair.random().publicKey();
+  const OTHER_ADDRESS = Keypair.random().publicKey();
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -128,8 +129,8 @@ describe('UserProfile (E2E) — email privacy', () => {
   let app: INestApplication;
   let authService: AuthService;
 
-  const OWNER_ADDRESS = 'G' + 'C'.repeat(55);
-  const OTHER_ADDRESS = 'G' + 'D'.repeat(55);
+  const OWNER_ADDRESS = Keypair.random().publicKey();
+  const OTHER_ADDRESS = Keypair.random().publicKey();
   const OWNER_EMAIL = 'private.owner@example.com';
   const OWNER_NAME = 'Privacy Probe Owner';
   let profileId: string;

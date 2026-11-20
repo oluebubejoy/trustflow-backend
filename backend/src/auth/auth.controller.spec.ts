@@ -15,8 +15,9 @@ describe('AuthController', () => {
     mockAuthService = {
       generateChallenge: jest.fn().mockResolvedValue(TEST_CHALLENGE),
       verifySignature: jest.fn().mockResolvedValue(true),
-      generateToken: jest.fn().mockReturnValue('mock-jwt-token'),
-      generateRefreshToken: jest.fn().mockResolvedValue('mock-refresh-token'),
+      issueSession: jest
+        .fn()
+        .mockResolvedValue({ token: 'mock-jwt-token', refreshToken: 'mock-refresh-token' }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -53,8 +54,7 @@ describe('AuthController', () => {
         TEST_ADDRESS,
         'SGVsbG8gV29ybGQh',
       );
-      expect(mockAuthService.generateToken).toHaveBeenCalledWith(TEST_ADDRESS, 3600);
-      expect(mockAuthService.generateRefreshToken).toHaveBeenCalledWith(TEST_ADDRESS);
+      expect(mockAuthService.issueSession).toHaveBeenCalledWith(TEST_ADDRESS);
     });
 
     it('should throw on invalid signature', async () => {

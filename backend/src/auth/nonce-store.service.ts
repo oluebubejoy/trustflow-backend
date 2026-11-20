@@ -3,7 +3,7 @@ import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 
-const NONCE_TTL_SECONDS = 60;
+export const NONCE_TTL_SECONDS = 60;
 const CONSUMED_TTL_SECONDS = 300;
 
 export interface WalletRateLimitResult {
