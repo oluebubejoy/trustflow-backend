@@ -4,6 +4,7 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  OnModuleDestroy,
   OnModuleInit,
   ForbiddenException,
   Optional,
@@ -74,6 +75,12 @@ export const SAGA_EVENTS = {
 const SAGA_KEY_PREFIX = 'saga:';
 const SAGAS_INDEX_KEY = 'sagas:index';
 const SAGAS_BY_ESCROW_PREFIX = 'sagas:by-escrow:';
+const PAYOUT_CLAIM_PREFIX = 'saga:payout-claim:';
+
+/** How long jurors have to vote before the sweep may finalize on quorum (#852, #855). */
+export const DISPUTE_VOTING_WINDOW_MS = 72 * 60 * 60 * 1000;
+const VOTING_SWEEP_INTERVAL_MS = 60_000;
+const PAYOUT_CLAIM_TTL_MS = 5 * 60 * 1000;
 
 /** Emitted (see `GET /metrics`) every time a call falls back to the in-memory store. */
 export const DISPUTE_SAGA_PERSISTENCE_FALLBACK_METRIC = 'dispute_saga_persistence_fallback_total';
@@ -114,7 +121,7 @@ export interface EscalateOptions {
  * row-level locking to coordinate across instances.
  */
 @Injectable()
-export class DisputeSagaService implements OnModuleInit {
+export class DisputeSagaService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new SanitizedLogger(DisputeSagaService.name);
   /** Fallback saga store, only used while Redis is unavailable. */
   private readonly sagas: Map<string, DisputeSaga> = new Map();
@@ -123,6 +130,7 @@ export class DisputeSagaService implements OnModuleInit {
   /** Mutex for serializing escalations per escrow (and saga transitions per saga). */
   private readonly escalateMutex = new KeyedMutex();
   private readonly sagaMutex = new KeyedMutex();
+  private votingSweepTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly escrowService: EscrowService,
@@ -146,6 +154,16 @@ export class DisputeSagaService implements OnModuleInit {
           'start with per-instance in-memory storage, which would silently diverge across instances.',
       );
     }
+    if (config.NODE_ENV !== 'test') {
+      this.votingSweepTimer = setInterval(() => {
+        this.sweepExpiredVoting().catch(err => this.logger.error('Dispute voting sweep failed', err));
+      }, VOTING_SWEEP_INTERVAL_MS);
+      this.votingSweepTimer.unref?.();
+    }
+  }
+
+  onModuleDestroy(): void {
+    if (this.votingSweepTimer) clearInterval(this.votingSweepTimer);
   }
 
   // ─── Queries ──────────────────────────────────────────────────────
@@ -592,6 +610,9 @@ export class DisputeSagaService implements OnModuleInit {
 
       try {
         saga.assignedJurors = unique;
+        saga.votingDeadline = toUtcIsoString(
+          new Date(getCurrentUtcDate().getTime() + DISPUTE_VOTING_WINDOW_MS),
+        );
         this.recordStepComplete(saga, DisputeStep.JUROR_ASSIGNMENT);
         saga.currentStep = DisputeStep.VOTING;
         this.touch(saga);
@@ -734,6 +755,64 @@ export class DisputeSagaService implements OnModuleInit {
     });
   }
 
+  /** Majority of all assigned jurors — not of votes cast so far (#853). */
+  quorumFor(saga: DisputeSaga): number {
+    return Math.floor((saga.assignedJurors?.length ?? 0) / 2) + 1;
+  }
+
+  /**
+   * Finalizes voting from the persisted votes (the source of truth, #852) once
+   * the voting window has closed. Refuses to finalize below quorum (#853).
+   */
+  async finalizeVoting(sagaId: string): Promise<DisputeSaga> {
+    return this.sagaMutex.lock(sagaId, async () => {
+      const saga = await this.findById(sagaId);
+      this.assertStep(saga, DisputeStep.VOTING);
+      if (saga.verdict) return saga;
+
+      const votes = saga.votes ?? [];
+      const quorum = this.quorumFor(saga);
+      if (votes.length < quorum) {
+        throw new BadRequestException(
+          `Quorum not reached: ${votes.length} of ${quorum} required votes recorded`,
+        );
+      }
+
+      saga.verdict = this.computeVerdict(votes);
+      this.recordStepComplete(saga, DisputeStep.VOTING);
+      saga.currentStep = DisputeStep.PAYOUT;
+      this.touch(saga);
+      await this.persistSaga(saga);
+
+      await this.webhookService.dispatch(SAGA_EVENTS.VERDICT_REACHED, {
+        sagaId,
+        verdict: saga.verdict,
+      });
+      this.logger.log(`Saga ${sagaId}: verdict reached on quorum — ${saga.verdict}`);
+      return saga;
+    });
+  }
+
+  /**
+   * Finalizes every VOTING saga whose voting window has closed and which has
+   * reached quorum (#855). Sagas below quorum are left for later.
+   */
+  async sweepExpiredVoting(now: Date = getCurrentUtcDate()): Promise<number> {
+    let finalized = 0;
+    for (const saga of await this.findAll()) {
+      if (saga.currentStep !== DisputeStep.VOTING || saga.verdict || !saga.votingDeadline) continue;
+      if (new Date(saga.votingDeadline).getTime() > now.getTime()) continue;
+      if ((saga.votes?.length ?? 0) < this.quorumFor(saga)) continue;
+      try {
+        await this.finalizeVoting(saga.sagaId);
+        finalized++;
+      } catch (err) {
+        this.logger.warn(`Saga ${saga.sagaId}: voting sweep could not finalize — ${String(err)}`);
+      }
+    }
+    return finalized;
+  }
+
   /** Simple majority vote tally */
   private computeVerdict(votes: JurorVote[]): DisputeVerdict {
     const tally = { depositor: 0, beneficiary: 0, split: 0 };
@@ -795,6 +874,12 @@ export class DisputeSagaService implements OnModuleInit {
       // Check if payout was already executed (another request won the race)
       if (saga.payoutTxHash) {
         throw new ConflictException('Payout has already been executed for this saga');
+      }
+
+      // The per-saga mutex only serializes within one instance; claim the payout
+      // in Redis so a parallel request on another instance can't also submit (#854).
+      if (!(await this.claimPayout(sagaId))) {
+        throw new ConflictException('Payout is already in progress or executed for this saga');
       }
 
       this.recordStepStart(saga, DisputeStep.PAYOUT);
@@ -867,10 +952,34 @@ export class DisputeSagaService implements OnModuleInit {
         this.logger.log(`Saga ${sagaId}: completed — payout executed for ${saga.verdict}`);
         return saga;
       } catch (error) {
+        await this.releasePayoutClaim(sagaId);
         await this.compensatePayout(saga, error);
         throw error;
       }
     });
+  }
+
+  /** Atomically claims the right to submit this saga's payout. No-op without Redis. */
+  private async claimPayout(sagaId: string): Promise<boolean> {
+    if (!this.redis) return true;
+    let ok: string | null;
+    try {
+      ok = await this.redis.set(PAYOUT_CLAIM_PREFIX + sagaId, '1', 'PX', PAYOUT_CLAIM_TTL_MS, 'NX');
+    } catch (err) {
+      // Same degraded mode as the rest of the store: fall back to the in-process mutex.
+      this.logFallback('claimPayout', err);
+      return true;
+    }
+    if (ok !== 'OK') return false;
+    // Another instance may have completed the payout between our read and the claim.
+    const fresh = await this.tryFindById(sagaId);
+    if (fresh?.payoutTxHash || fresh?.currentStep === DisputeStep.COMPLETED) return false;
+    return true;
+  }
+
+  private async releasePayoutClaim(sagaId: string): Promise<void> {
+    if (!this.redis) return;
+    await this.redis.del(PAYOUT_CLAIM_PREFIX + sagaId).catch(() => undefined);
   }
 
   /** Apply the payout by releasing or marking the escrow based on the verdict */

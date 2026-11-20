@@ -56,6 +56,8 @@ export interface DisputeSaga {
   escalationTxHash?: string;
   assignedJurors?: string[];
   votes?: JurorVote[];
+  /** After this time the voting sweep finalizes the dispute once quorum is met. */
+  votingDeadline?: string;
   verdict?: DisputeVerdict;
   payoutTxHash?: string;
   /** Evidence packages pinned during the dispute, in submission order. */
